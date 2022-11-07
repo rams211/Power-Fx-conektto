@@ -3,6 +3,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Numerics;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
@@ -10,9 +11,11 @@ using Microsoft.PowerFx.Core.App.ErrorContainers;
 using Microsoft.PowerFx.Core.Binding;
 using Microsoft.PowerFx.Core.Errors;
 using Microsoft.PowerFx.Core.Functions;
+using Microsoft.PowerFx.Core.IR;
 using Microsoft.PowerFx.Core.Localization;
 using Microsoft.PowerFx.Core.Types;
 using Microsoft.PowerFx.Core.Utils;
+using Microsoft.PowerFx.Functions;
 using Microsoft.PowerFx.Syntax;
 using Microsoft.PowerFx.Types;
 using static Microsoft.PowerFx.Core.Localization.TexlStrings;
@@ -25,6 +28,8 @@ namespace Microsoft.PowerFx
     internal class CustomTexlFunction : TexlFunction
     {
         public Func<IServiceProvider, FormulaValue[], CancellationToken, Task<FormulaValue>> _impl;
+
+        internal BigInteger LamdaParamMask;
 
         public override bool SupportsParamCoercion => true;
 
@@ -54,6 +59,11 @@ namespace Microsoft.PowerFx
         {
             return _impl(serviceProvider, args, cancellationToken);
         }
+
+        public override bool IsLazyEvalParam(int index)
+        {
+            return LamdaParamMask.TestBit(index);
+        }
     }
 
     // Helper for SetPropertyFunction 
@@ -68,6 +78,8 @@ namespace Microsoft.PowerFx
         public override bool IsSelfContained => false; // marks as behavior 
 
         public override bool SupportsParamCoercion => false;
+
+        public override bool CheckTypesAndSemanticsOnly => true;
 
         public Func<FormulaValue[], Task<FormulaValue>> _impl;
 
@@ -84,9 +96,8 @@ namespace Microsoft.PowerFx
         }
 
         // 2nd argument should be same type as 1st argument. 
-        public override bool CheckInvocation(TexlBinding binding, TexlNode[] args, DType[] argTypes, IErrorContainer errors, out DType returnType, out Dictionary<TexlNode, DType> nodeToCoercedTypeMap)
+        protected override bool CheckTypes(TexlNode[] args, DType[] argTypes, IErrorContainer errors, out DType returnType, out Dictionary<TexlNode, DType> nodeToCoercedTypeMap)
         {
-            Contracts.AssertValue(binding);
             Contracts.AssertValue(args);
             Contracts.AssertAllValues(args);
             Contracts.AssertValue(argTypes);
@@ -187,6 +198,8 @@ namespace Microsoft.PowerFx
             public MethodInfo _method;
 
             public bool _isAsync;
+
+            public BigInteger LamdaParamMask;
         }
 
         private FunctionDescr Scan()
@@ -234,6 +247,16 @@ namespace Microsoft.PowerFx
                     else if (parameters[i].ParameterType == typeof(CancellationToken) && info._isAsync)
                     {
                         throw new InvalidOperationException($"Cancellation token must be the last argument.");
+                    }
+                    else if (parameters[i].ParameterType == typeof(Func<Task<BooleanValue>>))
+                    {
+                        info.LamdaParamMask = info.LamdaParamMask | BigInteger.One << i;
+                        paramTypes.Add(FormulaType.Boolean);
+                    }
+                    else if (parameters[i].ParameterType.BaseType == typeof(MulticastDelegate))
+                    {
+                        // Currently only Func<Task<BooleanValue> is supported.
+                        throw new InvalidOperationException($"Unknown parameter type: {parameters[i].Name}, {parameters[i].ParameterType}. Only {typeof(Func<Task<BooleanValue>>)} is supported");
                     }
                     else
                     { 
@@ -287,7 +310,8 @@ namespace Microsoft.PowerFx
 
             return new CustomTexlFunction(info.Name, info.RetType, info.ParamTypes)
             {
-                _impl = (runtimeConfig, args, cancellationToken) => InvokeAsync(runtimeConfig, args, cancellationToken)
+                _impl = (runtimeConfig, args, cancellationToken) => InvokeAsync(runtimeConfig, args, cancellationToken),
+                LamdaParamMask = info.LamdaParamMask,
             };
         }
 
@@ -314,9 +338,51 @@ namespace Microsoft.PowerFx
                 }
             }
 
-            foreach (var arg in args)
+            List<ErrorValue> errors = null;
+            for (var i = 0; i < args.Length; i++)
             {
+                object arg = args[i];
+
+                // In case, ReflectionFunction was created using the constructor which takes paramtypes as optional argument paramtypes could be null.
+                var expectedType = _info.ParamTypes.Length <= i ? default : _info.ParamTypes[i];
+                if (arg is ErrorValue ev)
+                {
+                    if (errors == null)
+                    {
+                        errors = new List<ErrorValue>();
+                    }
+
+                    errors.Add(ev);
+                }
+                else if (arg is BlankValue && expectedType is NumberType)
+                {
+                    arg = FormulaValue.New(0);
+                }
+                else if (arg is BlankValue && expectedType is StringType)
+                {
+                    arg = FormulaValue.New(string.Empty);
+                }
+                else if (arg is BlankValue)
+                {
+                    if (errors == null)
+                    {
+                        errors = new List<ErrorValue>();
+                    }
+
+                    errors.Add(CommonErrors.RuntimeTypeMismatch(IRContext.NotInSource(FormulaType.Blank)));
+                }
+                else if (arg is LambdaFormulaValue lambda)
+                {
+                    Func<Task<BooleanValue>> argLambda = async () => (BooleanValue)await lambda.EvalAsync();
+                    arg = argLambda;
+                }
+
                 args2.Add(arg);
+            }
+
+            if (errors != null)
+            {
+                return ErrorValue.Combine(IRContext.NotInSource(_info.RetType), errors);
             }
 
             if (_info._isAsync)
